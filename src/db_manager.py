@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, List
 
@@ -40,6 +41,15 @@ async def seed(db_path: str, config: Dict[str, Any]) -> None:
                 log_sample_id TEXT NOT NULL,
                 model TEXT NOT NULL,
                 summary TEXT,
+                prompt_used TEXT,
+                parameters_used TEXT,
+                latency_ms REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                success INTEGER NOT NULL,
+                error_message TEXT,
+                retry_attempts INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
                 FOREIGN KEY (log_sample_id) REFERENCES log_samples(id)
             )
             """
@@ -86,15 +96,45 @@ async def save_sample(
         await conn.commit()
 
 
-async def save_response(
-    db_path: str, log_sample_id: str, model: str, summary: str
+async def save_model_response(
+    db_path: str,
+    log_sample_id: str,
+    model: str,
+    summary: str,
+    prompt_used: str,
+    parameters_used: str,
+    latency_ms: float,
+    input_tokens: int,
+    output_tokens: int,
+    success: bool,
+    error_message: str,
+    retry_attempts: int,
 ) -> None:
-    """saves a model's summary for a given log sample."""
+    """saves a model's summary and performance metrics for a given log sample."""
     response_id = str(uuid.uuid4())
+    timestamp = time.time()
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
-            "INSERT INTO model_responses (id, log_sample_id, model, summary) VALUES (?, ?, ?, ?)",
-            (response_id, log_sample_id, model, summary),
+            """INSERT INTO model_responses (
+                id, log_sample_id, model, summary, prompt_used, parameters_used,
+                latency_ms, input_tokens, output_tokens, success, error_message,
+                retry_attempts, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                response_id,
+                log_sample_id,
+                model,
+                summary,
+                prompt_used,
+                parameters_used,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+                int(success),
+                error_message,
+                retry_attempts,
+                timestamp,
+            ),
         )
         await conn.commit()
 

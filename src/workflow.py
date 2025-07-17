@@ -55,7 +55,7 @@ async def summarize_logs_node(state: WorkflowState) -> WorkflowState:
                     row["content"],
                     provider,
                     model_config,
-                    rate_limit,
+                    state["config"],
                 )
             )
 

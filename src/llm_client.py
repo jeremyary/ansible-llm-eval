@@ -1,18 +1,21 @@
 import asyncio
+import json
 import logging
 import os
+import time
 from typing import Any, Dict
 
-from aiolimiter import AsyncLimiter
 from langchain.chains.llm import LLMChain
 from langchain.llms.base import BaseLLM
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
-from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from tenacity import (
+    before_sleep_log,
     retry,
+    RetryError,
     stop_after_attempt,
     wait_exponential,
 )
@@ -23,16 +26,16 @@ from src.config_manager import load_config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def get_llm(provider: str, model: str, api_key: str = None) -> BaseLLM:
+def get_llm(provider: str, model: str, api_key: str = None, **kwargs) -> BaseLLM:
     """returns a language model instance based on the provider."""
     if provider == "openai":
-        return ChatOpenAI(model_name=model, api_key=api_key, temperature=0)
+        return ChatOpenAI(model_name=model, api_key=api_key, **kwargs)
     if provider == "gemini":
-        return ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0)
+        return ChatGoogleGenerativeAI(model=model, google_api_key=api_key, **kwargs)
     if provider == "anthropic":
-        return ChatAnthropic(model=model, api_key=api_key, temperature=0)
+        return ChatAnthropic(model=model, api_key=api_key, **kwargs)
     if provider == "ollama":
-        return ChatOllama(model=model)
+        return ChatOllama(model=model, **kwargs)
     raise ValueError(f"unsupported llm provider: {provider}")
 
 
@@ -46,24 +49,6 @@ def get_api_key_for_provider(provider: str) -> str | None:
     return os.environ.get(key_map.get(provider))
 
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60))
-async def process(
-    payload: str,
-    llm_chain: LLMChain,
-    rate_limiter: AsyncLimiter,
-) -> str:
-    """processes log file (or chunk) with the llm."""
-    async with rate_limiter:
-        try:
-            logging.info("processing chunk with llm.")
-            response = await llm_chain.arun(payload)
-            logging.info("successfully processed chunk.")
-            return response.strip()
-        except Exception as e:
-            logging.error("llm processing failed: %s", e, exc_info=True)
-            raise
-
-
 async def summarize(
     db_writer_queue: asyncio.Queue,
     semaphore: asyncio.Semaphore,
@@ -71,54 +56,74 @@ async def summarize(
     log_content: str,
     provider: str,
     model_config: Dict[str, Any],
+    config: Dict[str, Any],
 ) -> None:
-    """summarizes a log file using the specified llm."""
+    """
+    Summarizes a log file using a specified LLM, with retries and performance tracking.
+    """
     model_name = model_config["name"]
     api_key = get_api_key_for_provider(provider)
+    prompt_template_str = config["prompt_template"]
+    llm_parameters = model_config.get("parameters", {})
+    retry_settings = config["app_settings"]["retry_settings"]
 
-    async with semaphore:
-        try:
-            llm = get_llm(
-                provider, model_name, api_key
-            )
-            template = """
-            summarize the following ansible log content.
-            focus on the key actions, errors, and outcomes.
-            be concise and clear.
-            log content:
-            "{log_content}"
-            summary:
-            """
-            prompt = PromptTemplate(template=template, input_variables=["log_content"])
-            llm_chain = LLMChain(prompt=prompt, llm=llm)
+    prompt = PromptTemplate(template=prompt_template_str, input_variables=["log_content"])
+    llm = get_llm(provider, model_name, api_key, **llm_parameters)
+    llm_chain = LLMChain(prompt=prompt, llm=llm)
 
-            summary = await process(
-                log_content, llm_chain, AsyncLimiter(10, 60) # Placeholder limiter
-            )
+    summary, success, error_message = "", False, None
+    input_tokens, output_tokens, latency_ms = 0, 0, 0.0
+    retry_attempts = 0
 
-            await db_writer_queue.put({
-                "action": "save_model_response",
-                "payload": {
-                    "log_sample_id": sample_id,
-                    "summary": summary,
-                    "model": f"{provider}:{model_name}",
-                },
-            })
-            logging.info(
-                "summary for sample_id %d with model %s completed.", sample_id, model_name
-            )
-        except (ValueError, Exception) as e:
-            logging.error(
-                "error during summarization for sample_id %d with model %s: %s",
-                sample_id,
-                model_name,
-                e,
-                exc_info=True,
-            )
-            await db_writer_queue.put({
-                "action": "log_error",
-                "payload": {
-                    "sample_id": sample_id,
-                    "error_message": f"error using {model_name}: {e}",
-                },
-            })
+    @retry(
+        stop=stop_after_attempt(retry_settings["max_attempts"]),
+        wait=wait_exponential(
+            multiplier=retry_settings["initial_backoff_seconds"],
+            max=retry_settings["max_backoff_seconds"],
+        ),
+        before_sleep=before_sleep_log(logging.getLogger(__name__), logging.INFO),
+        reraise=True,
+    )
+    async def _generate_summary_with_retry():
+        return await llm_chain.agenerate([{"log_content": log_content}])
+
+    start_time = time.monotonic()
+    try:
+        async with semaphore:
+            result = await _generate_summary_with_retry()
+        
+        latency_ms = (time.monotonic() - start_time) * 1000
+        summary = result.generations[0][0].text.strip()
+        token_usage = result.llm_output.get("token_usage", {})
+        input_tokens = token_usage.get("prompt_tokens", 0)
+        output_tokens = token_usage.get("completion_tokens", 0)
+        success = True
+        retry_attempts = _generate_summary_with_retry.retry.statistics.get("attempt_number", 1)
+
+    except RetryError as e:
+        latency_ms = (time.monotonic() - start_time) * 1000
+        error_message = f"LLM call failed after multiple retries: {str(e.last_attempt.exception())}"
+        retry_attempts = e.last_attempt.retry.statistics.get("attempt_number", 0)
+        logging.error("Error for sample %s with model %s: %s", sample_id, model_name, error_message)
+    except Exception as e:
+        latency_ms = (time.monotonic() - start_time) * 1000
+        error_message = f"An unexpected error occurred: {str(e)}"
+        retry_attempts = 1
+        logging.error("Unexpected error for sample %s with model %s: %s", sample_id, model_name, error_message, exc_info=True)
+
+    await db_writer_queue.put({
+        "action": "save_model_response",
+        "payload": {
+            "log_sample_id": sample_id,
+            "model": f"{provider}:{model_name}",
+            "summary": summary,
+            "prompt_used": prompt.format(log_content=log_content),
+            "parameters_used": json.dumps(llm_parameters),
+            "latency_ms": latency_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "success": success,
+            "error_message": error_message,
+            "retry_attempts": retry_attempts,
+        },
+    })
