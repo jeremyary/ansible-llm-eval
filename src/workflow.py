@@ -31,7 +31,9 @@ async def ingest_data_node(state: WorkflowState) -> WorkflowState:
         state["config"]["data_ingestion"],
         state["db_writer_queue"],
     )
-    logging.info("data ingestion complete.")
+    logging.info("data ingestion complete, waiting for db writer.")
+    await state["db_writer_queue"].join()
+    logging.info("db writer finished, proceeding to summarization.")
     return state
 
 
@@ -39,10 +41,17 @@ async def summarize_logs_node(state: WorkflowState) -> WorkflowState:
     """summarizes the ingested logs using the llm."""
     logging.info("starting log summarization.")
     config = state["config"]
-    pending_summaries = await get_samples(state["db_path"])
+    num_models = len(config["llm"]["models"])
+    pending_summaries = await get_samples(state["db_path"], num_models)
+    logging.info(f"found {len(pending_summaries)} log samples to summarize.")
+
+    if not pending_summaries:
+        return state
+
     semaphore = asyncio.Semaphore(config["llm"]["concurrent_requests"])
     rate_limit = config["llm"]["rate_limit_per_minute"]
     models_to_run = config["llm"]["models"]
+    logging.info(f"summarizing with models: {list(models_to_run.keys())}")
 
     tasks = []
     for row in pending_summaries:
@@ -59,18 +68,20 @@ async def summarize_logs_node(state: WorkflowState) -> WorkflowState:
                 )
             )
 
-    if tasks:
-        await asyncio.gather(*tasks)
-        logging.info("log summarization batch complete.")
-    else:
-        logging.info("no pending summaries to process.")
+    logging.info(f"created {len(tasks)} summarization tasks. waiting for completion...")
+    await asyncio.gather(*tasks)
+    logging.info("log summarization batch complete.")
+    logging.info("waiting for db writer to save summaries...")
+    await state["db_writer_queue"].join()
+    logging.info("db writer finished saving summaries.")
 
     return state
 
 
 async def should_continue_node(state: WorkflowState) -> str:
     """determines whether the workflow should continue."""
-    pending_summaries = await get_samples(state["db_path"])
+    num_models = len(state["config"]["llm"]["models"])
+    pending_summaries = await get_samples(state["db_path"], num_models)
     if not pending_summaries:
         logging.info("no more summaries to process. ending workflow.")
         return "end"
@@ -85,6 +96,8 @@ def create_workflow() -> StateGraph:
     workflow.add_node("ingest", ingest_data_node)
     workflow.add_node("summarize", summarize_logs_node)
 
+    workflow.add_edge("ingest", "summarize")
+
     workflow.add_conditional_edges(
         "summarize",
         should_continue_node,
@@ -98,7 +111,10 @@ def create_workflow() -> StateGraph:
     return workflow
 
 
-async def run_workflow() -> None:
+async def run_workflow(
+    db_writer_queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+) -> None:
     """initializes and runs the workflow."""
     config = load_config()
     db_path = config["database"]["path"]
@@ -106,8 +122,8 @@ async def run_workflow() -> None:
     initial_state: WorkflowState = {
         "config": config,
         "db_path": db_path,
-        "db_writer_queue": asyncio.Queue(),
-        "stop_event": asyncio.Event(),
+        "db_writer_queue": db_writer_queue,
+        "stop_event": stop_event,
     }
 
     workflow_graph = create_workflow()
@@ -115,9 +131,20 @@ async def run_workflow() -> None:
     await runnable.ainvoke(initial_state)
 
     # ensure the db writer queue is empty before exiting
-    await initial_state["db_writer_queue"].join()
-    initial_state["stop_event"].set()
+    await db_writer_queue.join()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_workflow())
+    # this is a test runner, requires a running db writer
+    from src.db_writer import writer_job
+
+    async def test_run() -> None:
+        """provides a test runner for the workflow."""
+        queue = asyncio.Queue()
+        event = asyncio.Event()
+        writer = asyncio.create_task(writer_job(queue, "test.db", event))
+        await run_workflow(queue, event)
+        event.set()
+        await writer
+
+    asyncio.run(test_run())

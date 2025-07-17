@@ -12,28 +12,30 @@ app_settings:
 
 data_ingestion:
   log_directory: "./ansible_logs"
-  enable_chunking: true
+  enable_chunking: false
   chunk_size: 10000
   chunk_overlap: 500
 
 llm:
+  concurrent_requests: 5
+  rate_limit_per_minute: 60
   models:
     openai:
-      name: "gpt-4o"
+      name: "gpt-4.1-2025-04-14"
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
         input_per_k_tokens: 0.005
         output_per_k_tokens: 0.015
     gemini:
-      name: "gemini-1.5-pro"
+      name: "gemini-2.5-flash"
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
         input_per_k_tokens: 0.007
         output_per_k_tokens: 0.021
     anthropic:
-      name: "claude-3-5-sonnet-20240229"
+      name: "claude-opus-4-20250514"
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
@@ -41,7 +43,7 @@ llm:
         output_per_k_tokens: 0.015
 
 prompt_template: |
-  You are an expert SRE. Summarize the following Ansible log sample concisely in natural language English, highlighting key events, errors, or successes. Keep the summary brief, around 2-3 sentences.
+  You are an expert SRE. Examine the following Ansible log content & summarize in natural language using English. Keep the summary brief, a sentence or two. In your response after the summary, include '[SUGGESTION]' plus one to two sentences summarizing any suggested action to address the error summarized.
 
   Ansible Log Sample:
 
@@ -49,4 +51,4 @@ prompt_template: |
 
 reporting:
   host: "0.0.0.0"
-  port: 8080 
+  port: 1111 

@@ -26,7 +26,7 @@ async def read_file(file_path: str) -> str:
         return ""
 
 
-def chunk(
+def chunk_content(
     content: str,
     chunk_size: int,
     chunk_overlap: int
@@ -56,10 +56,11 @@ async def process_files(
             file_path = os.path.join(log_directory, filename)
             log_content = await read_file(file_path)
             if not log_content:
+                logging.info(f"skipping non-log file: {file_path}")
                 continue
 
             if enable_chunking:
-                chunks = chunk(
+                chunks = chunk_content(
                     log_content, chunk_size, chunk_overlap
                 )
             else:
@@ -80,3 +81,4 @@ async def process_files(
                 })
     except OSError as e:
         logging.error("failed to process log files: %s", e, exc_info=True)
+    logging.info("finished processing files.")

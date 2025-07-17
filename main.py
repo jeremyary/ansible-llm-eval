@@ -34,7 +34,7 @@ async def main() -> None:
     logging.info("database writer started.")
 
     # run the main workflow
-    await run_workflow()
+    await run_workflow(db_writer_queue, stop_event)
 
     # stop the database writer
     stop_event.set()
@@ -46,7 +46,7 @@ async def main() -> None:
 
     reporting_config = config.get("reporting", {})
     host = reporting_config.get("host", "0.0.0.0")
-    port = reporting_config.get("port", 8080)
+    port = reporting_config.get("port", 1111)
 
     # Use localhost for the viewing URL if host is 0.0.0.0
     view_host = "localhost" if host == "0.0.0.0" else host

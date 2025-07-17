@@ -5,7 +5,6 @@ import os
 import time
 from typing import Any, Dict
 
-from langchain.chains.llm import LLMChain
 from langchain.llms.base import BaseLLM
 from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
@@ -26,7 +25,7 @@ from src.config_manager import load_config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def get_llm(provider: str, model: str, api_key: str = None, **kwargs) -> BaseLLM:
+def get_llm(provider: str, model: str, api_key: str = None, **kwargs) -> BaseLLM | None:
     """returns a language model instance based on the provider."""
     if provider == "openai":
         return ChatOpenAI(model_name=model, api_key=api_key, **kwargs)
@@ -39,7 +38,7 @@ def get_llm(provider: str, model: str, api_key: str = None, **kwargs) -> BaseLLM
     raise ValueError(f"unsupported llm provider: {provider}")
 
 
-def get_api_key_for_provider(provider: str) -> str | None:
+def get_api_key(provider: str) -> str | None:
     """Gets the API key for a given provider from environment variables."""
     key_map = {
         "openai": "OPENAI_API_KEY",
@@ -62,14 +61,20 @@ async def summarize(
     Summarizes a log file using a specified LLM, with retries and performance tracking.
     """
     model_name = model_config["name"]
-    api_key = get_api_key_for_provider(provider)
+    api_key = get_api_key(provider)
+    if not api_key and provider in ["openai", "gemini", "anthropic"]:
+        logging.warning(f"api key for {provider} not found. skipping.")
+        return
     prompt_template_str = config["prompt_template"]
     llm_parameters = model_config.get("parameters", {})
     retry_settings = config["app_settings"]["retry_settings"]
 
     prompt = PromptTemplate(template=prompt_template_str, input_variables=["log_content"])
     llm = get_llm(provider, model_name, api_key, **llm_parameters)
-    llm_chain = LLMChain(prompt=prompt, llm=llm)
+    if not llm:
+        return
+
+    llm_chain = prompt | llm
 
     summary, success, error_message = "", False, None
     input_tokens, output_tokens, latency_ms = 0, 0, 0.0
@@ -84,31 +89,32 @@ async def summarize(
         before_sleep=before_sleep_log(logging.getLogger(__name__), logging.INFO),
         reraise=True,
     )
-    async def _generate_summary_with_retry():
-        return await llm_chain.agenerate([{"log_content": log_content}])
+    async def _generate_summary():
+        return await llm_chain.ainvoke({"log_content": log_content})
 
     start_time = time.monotonic()
     try:
         async with semaphore:
-            result = await _generate_summary_with_retry()
-        
+            result = await _generate_summary()
         latency_ms = (time.monotonic() - start_time) * 1000
-        summary = result.generations[0][0].text.strip()
-        token_usage = result.llm_output.get("token_usage", {})
-        input_tokens = token_usage.get("prompt_tokens", 0)
-        output_tokens = token_usage.get("completion_tokens", 0)
+        summary = result.content.strip()
+
+        token_usage = result.usage_metadata
+
+        input_tokens = token_usage.get("input_tokens", 0)
+        output_tokens = token_usage.get("output_tokens", 0)
         success = True
-        retry_attempts = _generate_summary_with_retry.retry.statistics.get("attempt_number", 1)
+        retry_attempts = _generate_summary.retry.statistics.get("attempt_number", 1) - 1
 
     except RetryError as e:
         latency_ms = (time.monotonic() - start_time) * 1000
         error_message = f"LLM call failed after multiple retries: {str(e.last_attempt.exception())}"
-        retry_attempts = e.last_attempt.retry.statistics.get("attempt_number", 0)
+        retry_attempts = e.last_attempt.retry.statistics.get("attempt_number", 1) - 1
         logging.error("Error for sample %s with model %s: %s", sample_id, model_name, error_message)
     except Exception as e:
         latency_ms = (time.monotonic() - start_time) * 1000
         error_message = f"An unexpected error occurred: {str(e)}"
-        retry_attempts = 1
+        retry_attempts = 0
         logging.error("Unexpected error for sample %s with model %s: %s", sample_id, model_name, error_message, exc_info=True)
 
     await db_writer_queue.put({

@@ -1,12 +1,13 @@
 """streamlit reporting app for visualizing llm evaluation results."""
 import json
+import os
 import sqlite3
 from typing import Any, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
 
-from src.config_manager import load_config
+from config_manager import load_config
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -79,8 +80,73 @@ def calculate_statistics(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFra
 
 def run_app() -> None:
     """runs the streamlit reporting application."""
-    st.set_page_config(page_title="llm evaluation report", layout="wide")
-    st.title("ansible log summarization evaluation report")
+    st.set_page_config(page_title="Ansible log evaluation report", layout="wide")
+    
+    st.markdown("""
+        <style>
+        .stVerticalBlock {
+            padding-right: 6em;
+            padding-left: 4em;
+        }
+        .summary-box {
+            background-color: #262730;
+            border: 1px solid #444;
+            border-radius: 7px;
+            padding: 10px 10px 1px 10px;
+            margin-top:0;
+            margin-bottom: 7px;
+        }
+        .summary-box p {
+            margin-bottom: 7px;
+        }
+        .provider-name {
+            font-weight: bold;
+            color: #55a8f2;
+        }
+        .openai-provider-name {
+            font-weight: bold;
+            color: #10a37f;
+        }
+        .anthropic-provider-name {
+            font-weight: bold;
+            color: #d97757;
+        }
+        .google-provider-name {
+            font-weight: bold;
+            color: #356cf1;
+        }
+        .stats-text {
+            font-size: 0.9em;
+            color: #aaa;
+            font-style: normal;
+        }
+        .stTextArea textarea {
+            color: dimgray;
+            padding: 2em;
+            background-color: #1a1c24;
+        }
+        .stTextArea {
+            margin-bottom: 1em;
+        }
+        .suggestion-text {
+            font-weight: bold;
+            color: seagreen;
+        }
+        .stMainBlockContainer {
+            padding-top: 3rem;
+        }
+        .summary-text {
+            margin-left: 1em;
+            margin-right: 1em;
+            margin-bottom: 1em;
+            border-radius: 10px;
+            border: 2px solid #333;
+            padding: 20px;
+        }
+        .provider-title-row {
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
     config = load_config()
     conn = get_db_connection()
@@ -91,60 +157,92 @@ def run_app() -> None:
         st.warning("no evaluation results found in the database.")
         return
 
-    st.subheader("Model Performance Overview")
+    st.markdown("### Performance Summary")
     stats_df = calculate_statistics(results_df, config)
     st.dataframe(
         stats_df.style.format({
-            "Success Rate (%)": "{:.2f}",
+            "Success Rate (%)": "{:.0f}",
             "Avg Latency (ms)": "{:.0f}",
             "Total Cost (USD)": "${:.4f}",
-            "Avg Retries": "{:.2f}",
+            "Avg Retries": "{:.0f}",
         })
     )
+    
+    # Sort all chunks by filename and chunk index for a flat, scrollable list
+    all_chunks = results_df.sort_values(
+        by=["filename", "chunk_index"]
+    ).drop_duplicates(subset=['sample_id'])
 
-    st.subheader("Detailed View")
-    unique_files = results_df[["parent_log_id", "filename"]].drop_duplicates()
-    selected_parent_id = st.selectbox(
-        "select a log file to view details:",
-        options=unique_files["parent_log_id"],
-        format_func=lambda x: f"{unique_files[unique_files['parent_log_id'] == x]['filename'].iloc[0]}",
-    )
+    for _, chunk_row in all_chunks.iterrows():
 
-    if selected_parent_id:
-        sample_chunks = results_df[
-            results_df["parent_log_id"] == selected_parent_id
-        ].sort_values(by="chunk_index")
+        st.markdown(f"</br></br>", unsafe_allow_html=True)
+        if len(all_chunks) > 1:
+            stats = f"chunk {chunk_row['chunk_index'] + 1}, ID: {chunk_row['sample_id'][:8]}"
+        else:
+            stats = f"ID: {chunk_row['sample_id'][:8]}"
+        st.markdown(f"### {os.path.basename(chunk_row['filename'])} &nbsp; [ {stats} ]", unsafe_allow_html=True)
 
-        for _, chunk_row in sample_chunks.drop_duplicates(subset=['sample_id']).iterrows():
-            st.markdown(f"---")
-            st.markdown(f"#### Chunk {chunk_row['chunk_index']} (ID: `{chunk_row['sample_id'][:8]}`)")
-            st.text_area(
-                "original log content",
-                chunk_row["original_content"],
-                height=200,
-                key=f"content_{chunk_row['sample_id']}",
-            )
+        st.text_area(
+            "original log content",
+            chunk_row["original_content"],
+            height=200,
+            key=f"content_{chunk_row['sample_id']}",
+            label_visibility="collapsed"
+        )    
 
-            model_responses = sample_chunks[sample_chunks['sample_id'] == chunk_row['sample_id']]
-            
+        model_responses = results_df[
+            (results_df['sample_id'] == chunk_row['sample_id']) &
+            (pd.notna(results_df['model']))
+        ].sort_values(by="model")
+
+        if not model_responses.empty:
             for _, response_row in model_responses.iterrows():
-                if pd.notna(response_row['model']):
-                    with st.expander(f"**Model:** `{response_row['model']}` - {'Success' if response_row['success'] else 'Failed'}"):
-                        st.text_area(
-                            "Generated Summary",
-                            response_row["summary"] or "No summary generated.",
-                            height=100,
-                            key=f"summary_{response_row['sample_id']}_{response_row['model']}",
-                        )
-                        if not response_row['success']:
-                            st.error(f"**Error:** {response_row['error_message']}")
+                provider, _ = response_row['model'].split(":", 1)
 
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Latency (ms)", f"{response_row['latency_ms']:.0f}")
-                        col2.metric("Input Tokens", response_row['input_tokens'])
-                        col3.metric("Output Tokens", response_row['output_tokens'])
-                        col4.metric("Retries", response_row['retry_attempts'])
+                stats_html = ""
+                if response_row['success']:
+                    stats = (
+                        f"latency: {response_row['latency_ms']:.0f}ms &nbsp;|&nbsp; "
+                        f"tokens: {response_row['input_tokens']}/{response_row['output_tokens']} &nbsp;|&nbsp; "
+                        f"retries: {response_row['retry_attempts']}"
+                    )
+                    stats_html = f'&nbsp; <span class="stats-text">[ {stats} ]</span>'
 
+                if provider == "openai":
+                    provider_html = f'<span class="openai-provider-name">{provider.upper()}</span>'
+                elif provider == "anthropic":
+                    provider_html = f'<span class="anthropic-provider-name">{provider.upper()}</span>'
+                elif provider == "google":
+                    provider_html = f'<span class="google-provider-name">{provider.upper()}</span>'
+                else:
+                    provider_html = f'<span class="provider-name">{provider.upper()}</span>'
+                
+                line_html = f"<span class='provider-title-row'>{provider_html} {stats_html}</span>"
+                st.markdown(line_html, unsafe_allow_html=True)
+
+                summary_text = f"{response_row['summary']}" or "No summary generated."
+                suggestion_marker = "[SUGGESTION]"
+
+                if suggestion_marker in summary_text:
+                    parts = summary_text.split(suggestion_marker, 1)
+                    main_summary = parts[0].strip()
+                    suggestion = parts[1].strip()
+                    summary_html = f"""
+                    <div class="summary-text">
+                        {main_summary}</br>
+                        <div class="suggestion-text">{suggestion}</div>
+                    </div>
+                    """
+                else:
+                    summary_html = f"""
+                    <div class="summary-text">
+                        <p>{summary_text}</p>
+                    </div>
+                    """
+                st.markdown(summary_html, unsafe_allow_html=True)
+
+                if not response_row['success']:
+                    st.error(f"**Error:** {response_row['error_message']}")
 
 if __name__ == "__main__":
     run_app()

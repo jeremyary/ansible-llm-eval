@@ -69,12 +69,21 @@ async def seed(db_path: str, config: Dict[str, Any]) -> None:
     logging.info("database initialized successfully.")
 
 
-async def get_samples(db_path: str) -> List[Dict[str, Any]]:
-    """fetches all log samples from the database."""
+async def get_samples(db_path: str, num_models: int) -> List[Dict[str, Any]]:
+    """fetches log samples from the database that have not been fully processed."""
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT id, content FROM log_samples")
+            await cursor.execute(
+                """
+                SELECT ls.id, ls.content
+                FROM log_samples ls
+                LEFT JOIN model_responses mr ON ls.id = mr.log_sample_id
+                GROUP BY ls.id
+                HAVING COUNT(mr.id) < ?
+                """,
+                (num_models,),
+            )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
@@ -96,7 +105,7 @@ async def save_sample(
         await conn.commit()
 
 
-async def save_model_response(
+async def save_response(
     db_path: str,
     log_sample_id: str,
     model: str,

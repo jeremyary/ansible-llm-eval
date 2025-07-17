@@ -1,5 +1,5 @@
 import yaml
-
+import logging
 
 def load_config(config_path: str = "config.yaml") -> dict:
     """loads the yaml configuration file."""
@@ -7,10 +7,10 @@ def load_config(config_path: str = "config.yaml") -> dict:
         with open(config_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
-        print(f"error: config file not found at {config_path}")
+        logging.error(f"error: config file not found at {config_path}")
         return {}
     except yaml.YAMLError as e:
-        print(f"error parsing yaml file: {e}")
+        logging.error(f"error parsing yaml file: {e}")
         return {}
 
 if __name__ == '__main__':

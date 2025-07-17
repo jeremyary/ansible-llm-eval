@@ -15,4 +15,12 @@ pyyaml
 python-dotenv
 requests
 streamlit
-tenacity 
+tenacity langchain
+langgraph
+aiosqlite
+langgraph
+langchain-google-genai
+langchain-openai
+langchain-anthropic
+langchain-community
+tenacity
