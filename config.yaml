@@ -1,0 +1,52 @@
+
+database:
+  path: "./results.db"
+  clear_on_startup: true
+
+app_settings:
+  max_concurrent_llm_calls: 15
+  retry_settings:
+    max_attempts: 5
+    initial_backoff_seconds: 1
+    max_backoff_seconds: 60
+
+data_ingestion:
+  log_directory: "./ansible_logs"
+  enable_chunking: true
+  chunk_size: 10000
+  chunk_overlap: 500
+
+llm:
+  models:
+    openai:
+      name: "gpt-4o"
+      parameters:
+        temperature: 0.7
+      pricing: # USD per 1,000 tokens
+        input_per_k_tokens: 0.005
+        output_per_k_tokens: 0.015
+    gemini:
+      name: "gemini-1.5-pro"
+      parameters:
+        temperature: 0.7
+      pricing: # USD per 1,000 tokens
+        input_per_k_tokens: 0.007
+        output_per_k_tokens: 0.021
+    anthropic:
+      name: "claude-3-5-sonnet-20240229"
+      parameters:
+        temperature: 0.7
+      pricing: # USD per 1,000 tokens
+        input_per_k_tokens: 0.003
+        output_per_k_tokens: 0.015
+
+prompt_template: |
+  You are an expert SRE. Summarize the following Ansible log sample concisely in natural language English, highlighting key events, errors, or successes. Keep the summary brief, around 2-3 sentences.
+
+  Ansible Log Sample:
+
+  {log_content}
+
+reporting:
+  host: "0.0.0.0"
+  port: 8080 
