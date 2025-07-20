@@ -1,3 +1,4 @@
+from functools import partial
 import asyncio
 import json
 import logging
@@ -11,6 +12,8 @@ from langchain_community.chat_models import ChatOllama
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 from tenacity import (
     before_sleep_log,
     retry,
@@ -20,6 +23,7 @@ from tenacity import (
 )
 
 from src.config_manager import load_config
+from src.rate_limiter import TokenRateLimiter
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,6 +55,7 @@ def get_api_key(provider: str) -> str | None:
 async def summarize(
     db_writer_queue: asyncio.Queue,
     semaphore: asyncio.Semaphore,
+    limiter: TokenRateLimiter,
     sample_id: int,
     log_content: str,
     provider: str,
@@ -62,9 +67,7 @@ async def summarize(
     """
     model_name = model_config["name"]
     api_key = get_api_key(provider)
-    if not api_key and provider in ["openai", "gemini", "anthropic"]:
-        logging.warning(f"api key for {provider} not found. skipping.")
-        return
+
     prompt_template_str = config["prompt_template"]
     llm_parameters = model_config.get("parameters", {})
     retry_settings = config["app_settings"]["retry_settings"]
@@ -74,11 +77,22 @@ async def summarize(
     if not llm:
         return
 
+    # estimate token count
+    prompt_for_token_count = prompt.format(log_content=log_content)
+    num_tokens = llm.get_num_tokens(prompt_for_token_count)
+
     llm_chain = prompt | llm
 
     summary, success, error_message = "", False, None
     input_tokens, output_tokens, latency_ms = 0, 0, 0.0
-    retry_attempts = 0
+    run_id = None
+
+    @traceable(run_type="llm", name=f"{provider}:{model_name}")
+    async def _traced_llm_call():
+        result = await llm_chain.ainvoke({"log_content": log_content})
+        run_tree = get_current_run_tree()
+        run_id = run_tree.id if run_tree else None
+        return result, run_id
 
     @retry(
         stop=stop_after_attempt(retry_settings["max_attempts"]),
@@ -90,12 +104,14 @@ async def summarize(
         reraise=True,
     )
     async def _generate_summary():
-        return await llm_chain.ainvoke({"log_content": log_content})
+        return await _traced_llm_call()
 
     start_time = time.monotonic()
     try:
+        await limiter.wait_for_capacity(num_tokens)
         async with semaphore:
-            result = await _generate_summary()
+            result, run_id = await _generate_summary()
+
         latency_ms = (time.monotonic() - start_time) * 1000
         summary = result.content.strip()
 
@@ -122,6 +138,7 @@ async def summarize(
         "payload": {
             "log_sample_id": sample_id,
             "model": f"{provider}:{model_name}",
+            "run_id": str(run_id) if run_id else None,
             "summary": summary,
             "prompt_used": prompt.format(log_content=log_content),
             "parameters_used": json.dumps(llm_parameters),

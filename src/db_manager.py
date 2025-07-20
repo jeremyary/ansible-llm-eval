@@ -40,6 +40,7 @@ async def seed(db_path: str, config: Dict[str, Any]) -> None:
                 id TEXT PRIMARY KEY,
                 log_sample_id TEXT NOT NULL,
                 model TEXT NOT NULL,
+                run_id TEXT,
                 summary TEXT,
                 prompt_used TEXT,
                 parameters_used TEXT,
@@ -109,6 +110,7 @@ async def save_response(
     db_path: str,
     log_sample_id: str,
     model: str,
+    run_id: str,
     summary: str,
     prompt_used: str,
     parameters_used: str,
@@ -125,14 +127,15 @@ async def save_response(
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             """INSERT INTO model_responses (
-                id, log_sample_id, model, summary, prompt_used, parameters_used,
+                id, log_sample_id, model, run_id, summary, prompt_used, parameters_used,
                 latency_ms, input_tokens, output_tokens, success, error_message,
                 retry_attempts, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 response_id,
                 log_sample_id,
                 model,
+                run_id,
                 summary,
                 prompt_used,
                 parameters_used,

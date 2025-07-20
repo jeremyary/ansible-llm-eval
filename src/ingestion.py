@@ -51,12 +51,12 @@ async def process_files(
 
     try:
         for filename in os.listdir(log_directory):
-            if not filename.endswith(".log"):
+            if not filename.endswith(".txt"):
                 continue
             file_path = os.path.join(log_directory, filename)
             log_content = await read_file(file_path)
             if not log_content:
-                logging.info(f"skipping non-log file: {file_path}")
+                logging.info(f"skipping non-txt file: {file_path}")
                 continue
 
             if enable_chunking:

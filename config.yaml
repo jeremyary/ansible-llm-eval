@@ -1,9 +1,10 @@
 
 database:
   path: "./results.db"
-  clear_on_startup: true
+  clear_on_startup: false # clear db on each startup
 
 app_settings:
+  ux_development_mode: true  # skip llm calls when true
   max_concurrent_llm_calls: 15
   retry_settings:
     max_attempts: 5
@@ -12,7 +13,7 @@ app_settings:
 
 data_ingestion:
   log_directory: "./ansible_logs"
-  enable_chunking: false
+  enable_chunking: true
   chunk_size: 10000
   chunk_overlap: 500
 
@@ -22,6 +23,7 @@ llm:
   models:
     openai:
       name: "gpt-4.1-2025-04-14"
+      rate_limit_tpm: 40000
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
@@ -29,6 +31,7 @@ llm:
         output_per_k_tokens: 0.015
     gemini:
       name: "gemini-2.5-flash"
+      rate_limit_tpm: 100000
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
@@ -36,6 +39,7 @@ llm:
         output_per_k_tokens: 0.021
     anthropic:
       name: "claude-opus-4-20250514"
+      rate_limit_tpm: 20000
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens
@@ -43,7 +47,10 @@ llm:
         output_per_k_tokens: 0.015
 
 prompt_template: |
-  You are an expert SRE. Examine the following Ansible log content & summarize in natural language using English. Keep the summary brief, a sentence or two. In your response after the summary, include '[SUGGESTION]' plus one to two sentences summarizing any suggested action to address the error summarized.
+  You are an expert SRE. Examine the following Ansible log content & summarize any errors encounteredin natural language using English. 
+  Keep the summary brief, a sentence or two. If you find no errors, just reply with "No errors found." and nothing more. If you do find errors, in your response 
+  after the summary, you must include '[SUGGESTION]' followed by one to two sentences summarizing any suggested action to address the error(s) summarized.
+  We should not consider warnings as errors.
 
   Ansible Log Sample:
 

@@ -1,6 +1,7 @@
 """main entry point for the llm evaluation application."""
 import asyncio
 import logging
+import os
 import subprocess
 from dotenv import load_dotenv
 
@@ -18,6 +19,13 @@ logging.basicConfig(
 async def main() -> None:
     """main function to run the application."""
     load_dotenv()
+
+    # If the LangSmith API key is set, configure tracing
+    if os.getenv("LANGSMITH_API_KEY"):
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = "ansible-llm-eval"
+        logging.info("LangSmith tracing enabled for project 'ansible-llm-eval'.")
+
     config = load_config()
     db_path = config["database"]["path"]
 
@@ -55,10 +63,10 @@ async def main() -> None:
         "streamlit",
         "run",
         "src/reporting_app.py",
-        "--server.headless=true",
-        "--browser.gatherUsageStats=false",
-        f"--server.port={port}",
-        f"--server.address={host}",
+        "--server.address", host,
+        "--server.port", str(port),
+        "--server.headless", "true",
+        "--browser.gatherUsageStats", "false"
     ]
 
     with subprocess.Popen(command) as proc:

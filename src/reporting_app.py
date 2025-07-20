@@ -27,6 +27,7 @@ def load_data(conn: sqlite3.Connection) -> Tuple[pd.DataFrame, pd.DataFrame]:
         ls.chunk_index,
         ls.content as original_content,
         mr.model,
+        mr.run_id,
         mr.summary,
         mr.latency_ms,
         mr.input_tokens,
@@ -117,8 +118,14 @@ def run_app() -> None:
         }
         .stats-text {
             font-size: 0.9em;
-            color: #aaa;
+            color: #656565;
             font-style: normal;
+        }
+        .stButton button {
+            padding: 0.1em 0.5em;
+            font-size: 0.9em;
+            line-height: 1.2;
+            height: auto;
         }
         .stTextArea textarea {
             color: dimgray;
@@ -127,6 +134,7 @@ def run_app() -> None:
         }
         .stTextArea {
             margin-bottom: 1em;
+            margin-left: 0.25em;
         }
         .suggestion-text {
             font-weight: bold;
@@ -143,8 +151,6 @@ def run_app() -> None:
             border: 2px solid #333;
             padding: 20px;
         }
-        .provider-title-row {
-        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -157,7 +163,23 @@ def run_app() -> None:
         st.warning("no evaluation results found in the database.")
         return
 
-    st.markdown("### Performance Summary")
+    total_latency_ms = results_df['latency_ms'].sum()
+    total_time_seconds = total_latency_ms / 1000
+
+    # format the time
+    hours, rem = divmod(total_time_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    
+    time_str = ""
+    if hours:
+        time_str += f"{int(hours)}h "
+    if minutes:
+        time_str += f"{int(minutes)}m "
+    
+    time_str += f"{seconds:.0f}s"
+    
+    st.markdown(f"### Performance Summary &nbsp; <span class='stats-text'>(total time: {time_str})</span>", unsafe_allow_html=True)
+
     stats_df = calculate_statistics(results_df, config)
     st.dataframe(
         stats_df.style.format({
@@ -176,16 +198,13 @@ def run_app() -> None:
     for _, chunk_row in all_chunks.iterrows():
 
         st.markdown(f"</br></br>", unsafe_allow_html=True)
-        if len(all_chunks) > 1:
-            stats = f"chunk {chunk_row['chunk_index'] + 1}, ID: {chunk_row['sample_id'][:8]}"
-        else:
-            stats = f"ID: {chunk_row['sample_id'][:8]}"
-        st.markdown(f"### {os.path.basename(chunk_row['filename'])} &nbsp; [ {stats} ]", unsafe_allow_html=True)
+        stats = f"chunk {chunk_row['chunk_index'] + 1}"
+        st.markdown(f"### {os.path.basename(chunk_row['filename'])} &nbsp; ({stats})", unsafe_allow_html=True)
 
         st.text_area(
             "original log content",
             chunk_row["original_content"],
-            height=200,
+            height=400,
             key=f"content_{chunk_row['sample_id']}",
             label_visibility="collapsed"
         )    
@@ -199,7 +218,7 @@ def run_app() -> None:
             for _, response_row in model_responses.iterrows():
                 provider, _ = response_row['model'].split(":", 1)
 
-                stats_html = ""
+                # stats_html = ""
                 if response_row['success']:
                     stats = (
                         f"latency: {response_row['latency_ms']:.0f}ms &nbsp;|&nbsp; "
@@ -243,6 +262,59 @@ def run_app() -> None:
 
                 if not response_row['success']:
                     st.error(f"**Error:** {response_row['error_message']}")
+        
+    js_script = """
+    <script>
+        function styleAllSliders() {
+            const sliders = document.querySelectorAll('.stSlider');
+
+            sliders.forEach(slider => {
+                const thumb = slider.querySelector('[role="slider"]');
+                if (!thumb) return;
+
+                const min = parseInt(thumb.getAttribute('aria-valuemin'), 10);
+                const max = parseInt(thumb.getAttribute('aria-valuemax'), 10);
+                const value = parseInt(thumb.getAttribute('aria-valuemax'), 10);
+
+                const percentage = ((value - min) / (max - min));
+
+                let r, g, b;
+                if (percentage < 0.5) {
+                    r = 255;
+                    g = Math.round(510 * percentage);
+                } else {
+                    r = Math.round(510 - 510 * percentage);
+                    g = 255;
+                }
+                b = 0;
+                const color = `rgb(${r}, ${g}, ${b})`;
+
+                const trackFill = slider.querySelector('div[data-baseweb="slider"] > div:nth-child(2)');
+                const thumbElement = slider.querySelector('div[data-baseweb="slider"] > div:nth-child(3)');
+
+                if (trackFill) {
+                    trackFill.style.background = color;
+                }
+                if (thumbElement) {
+                    thumbElement.style.backgroundColor = color;
+                }
+            });
+        }
+
+        const observer = new MutationObserver((mutations) => {
+            styleAllSliders();
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        // Initial run
+        styleAllSliders();
+    </script>
+    """
+    st.markdown(js_script, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     run_app()

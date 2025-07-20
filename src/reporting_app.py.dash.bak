@@ -1,0 +1,252 @@
+"""streamlit reporting app for visualizing llm evaluation results."""
+import os
+import sqlite3
+from typing import Any, Dict, Tuple
+
+import dash
+import dash_bootstrap_components as dbc
+import pandas as pd
+from dash import dcc, html
+from dash.dependencies import Input, Output, State
+
+from config_manager import load_config
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Establishes a connection to the SQLite database."""
+    config = load_config()
+    db_path = config["database"]["path"]
+    return sqlite3.connect(db_path)
+
+
+def load_data(conn: sqlite3.Connection) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Loads and joins data from the database."""
+    query = """
+    SELECT
+        ls.id as sample_id,
+        ls.filename,
+        ls.parent_log_id,
+        ls.chunk_index,
+        ls.content as original_content,
+        mr.model,
+        mr.run_id,
+        mr.summary,
+        mr.latency_ms,
+        mr.input_tokens,
+        mr.output_tokens,
+        mr.success,
+        mr.retry_attempts,
+        mr.error_message
+    FROM
+        log_samples ls
+    LEFT JOIN
+        model_responses mr ON ls.id = mr.log_sample_id
+    """
+    results_df = pd.read_sql_query(query, conn)
+    errors_df = pd.read_sql_query("SELECT * FROM errors", conn)
+    return results_df, errors_df
+
+
+def calculate_statistics(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+    """Calculates detailed summary statistics for each model."""
+    if df.empty or 'model' not in df.columns or df['model'].dropna().empty:
+        return pd.DataFrame()
+
+    stats = []
+    for model_name, group in df.dropna(subset=['model']).groupby('model'):
+        total_attempts = len(group)
+        successful_summaries = group['success'].sum()
+        provider, _ = model_name.split(":", 1)
+        pricing_info = config.get("llm", {}).get("models", {}).get(provider, {}).get("pricing", {})
+        
+        input_price = pricing_info.get("input_per_k_tokens", 0)
+        output_price = pricing_info.get("output_per_tokens", 0)
+
+        total_input_tokens = group['input_tokens'].sum()
+        total_output_tokens = group['output_tokens'].sum()
+        
+        cost = ((total_input_tokens / 1000) * input_price) + \
+               ((total_output_tokens / 1000) * output_price)
+
+        stats.append({
+            "Model": model_name,
+            "Success Rate (%)": (successful_summaries / total_attempts) * 100 if total_attempts > 0 else 0,
+            "Avg Latency (ms)": group['latency_ms'].mean(),
+            "Total Cost (USD)": cost,
+            "Avg Retries": group['retry_attempts'].mean(),
+            "Total Input Tokens": total_input_tokens,
+            "Total Output Tokens": total_output_tokens,
+        })
+    
+    stats_df = pd.DataFrame(stats)
+    if not stats_df.empty:
+        stats_df["Success Rate (%)"] = stats_df["Success Rate (%)"].map('{:.0f}'.format)
+        stats_df["Avg Latency (ms)"] = stats_df["Avg Latency (ms)"].map('{:.0f}'.format)
+        stats_df["Total Cost (USD)"] = stats_df["Total Cost (USD)"].map('${:.4f}'.format)
+        stats_df["Avg Retries"] = stats_df["Avg Retries"].map('{:.0f}'.format)
+
+    return stats_df.set_index("Model")
+
+
+# Initialize the Dash app with Darkly theme
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SLATE])
+
+# Load data
+conn = get_db_connection()
+results_df, errors_df = load_data(conn)
+conn.close()
+
+# Calculate statistics
+config = load_config()
+stats_df = calculate_statistics(results_df, config)
+
+# App layout
+app.layout = dbc.Container([
+    
+    # Performance Summary
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader([
+                    html.H4("Performance Summary", className="mb-1 text-white")
+                ], style={'background-color': '#11151e'}),
+                dbc.CardBody([
+                    dbc.Table.from_dataframe(
+                        stats_df.reset_index(), 
+                        striped=True, 
+                        bordered=True,
+                        className="mb-0"
+                    ) if not stats_df.empty else dbc.Alert(
+                        "No performance data available.", 
+                        color="warning"
+                    )
+                ], className="p-0", style={'color': 'blue'})
+            ], outline=True)
+        ])
+    ], className="mb-5"),
+    
+    # Detailed View
+    html.Div(id='detailed-view-content')
+    
+], fluid=False, className="py-4")
+
+
+@app.callback(
+    Output('detailed-view-content', 'children'),
+    Input('detailed-view-content', 'id')  # Dummy input to trigger callback on load
+)
+def update_detailed_view(_):
+    conn = get_db_connection()
+    results_df, _ = load_data(conn)
+    conn.close()
+
+    if results_df.empty:
+        return dbc.Alert("No evaluation results found in the database.", color="warning")
+
+    all_chunks = results_df.sort_values(
+        by=["filename", "chunk_index"]
+    ).drop_duplicates(subset=['sample_id'])
+
+    detailed_view_items = []
+    for idx, chunk_row in all_chunks.iterrows():
+        chunk_header = f"{os.path.basename(chunk_row['filename'])} (chunk {chunk_row['chunk_index'] + 1})"
+
+        # Log content
+        log_content = dbc.Card([
+            dbc.CardBody([
+                dcc.Textarea(
+                    value=chunk_row["original_content"],
+                    style={
+                        'width': '100%', 
+                        'height': '300px', 
+                        'resize': 'vertical',
+                        'backgroundColor': '#212529',
+                        'color': '#f8f9fa',
+                        'border': '1px solid #495057',
+                        'fontFamily': 'monospace',
+                        'fontSize': '13px',
+                        'padding': '15px'
+                    },
+                    readOnly=True
+                )
+            ])
+        ], color="dark", outline=False, className="mb-4")
+
+        # Model responses
+        model_responses_df = results_df[
+            (results_df['sample_id'] == chunk_row['sample_id']) &
+            (pd.notna(results_df['model']))
+        ].sort_values(by="model")
+        
+        summaries_layout = []
+        for _, response_row in model_responses_df.iterrows():
+            provider, model_variant = response_row['model'].split(":", 1)
+            
+            # Provider color mapping
+            provider_colors = {
+                'ANTHROPIC': '#d97757',
+                'GEMINI': '#356cf1', 
+                'OPENAI': '#10a37f'
+            }
+            provider_color = provider_colors.get(provider.upper(), '#55a8f2')
+            
+            # Stats display
+            stats_text = ""
+            if response_row['success']:
+                stats_text = (
+                    f"[ {response_row['latency_ms']:.0f}ms  |  "
+                    f"tokens: {response_row['input_tokens']}/{response_row['output_tokens']} | "
+                    f"retries: {response_row['retry_attempts']:.0f} ]"
+                )
+            
+            summary_text = response_row["summary"] or "No summary generated."
+            suggestion_marker = "[SUGGESTION]"
+            
+            if suggestion_marker in summary_text:
+                parts = summary_text.split(suggestion_marker, 1)
+                main_summary = parts[0].strip()
+                suggestion_part = parts[1].strip()
+                summary_content = html.Div([
+                    html.P(main_summary, className="mb-3"),
+                    html.P("SUGGESTION: " + suggestion_part, className="mb-0", style={'color': 'rgb(0, 214, 0)', 'fontWeight': '700'}),
+                ])
+            else:
+                summary_content = html.P(summary_text, className="mb-0")
+
+            provider_card = dbc.Card([
+                dbc.CardHeader([
+                    html.Div([
+                        html.H6(f"{provider.upper()}", className="mb-0 d-inline-block", style={
+                            'color': provider_color, 
+                            'fontWeight': '900', 
+                            'fontSize': '1.2rem'
+                        }),
+                        html.Small(f" {stats_text}", className="ms-3", style={'color': 'rgb(100, 100, 100)'})
+                    ])
+                ], style={'background-color': '#11151e'}),
+                dbc.CardBody(summary_content, className="py-3")
+            ], color="secondary", outline=True, className="mb-3")
+
+            summaries_layout.append(provider_card)
+
+        # Chunk container
+        chunk_card = dbc.Card([
+            dbc.CardHeader([
+                html.H4(chunk_header, className="mb-0")
+            ], style={'background-color': 'rgb(17, 21, 30)', 'color': '#c3c3c3'}),
+            dbc.CardBody([
+                log_content,
+                html.Div(summaries_layout)
+            ])
+        ], color="dark", outline=True, className="mb-4")
+        
+        detailed_view_items.append(chunk_card)
+        
+    return detailed_view_items
+
+
+if __name__ == '__main__':
+    reporting_config = config.get("reporting", {})
+    host = reporting_config.get("host", "0.0.0.0")
+    port = reporting_config.get("port", 1111)
+    app.run(debug=True, host=host, port=port)
