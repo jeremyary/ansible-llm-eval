@@ -1,10 +1,10 @@
 
 database:
   path: "./results.db"
-  clear_on_startup: false # clear db on each startup
+  clear_on_startup: true # clear db on each startup
 
 app_settings:
-  ux_development_mode: true  # skip llm calls when true
+  ux_development_mode: false # skip llm calls when true
   max_concurrent_llm_calls: 15
   retry_settings:
     max_attempts: 5
@@ -23,7 +23,7 @@ llm:
   models:
     openai:
       name: "gpt-4.1-2025-04-14"
-      rate_limit_tpm: 40000
+      rate_limit_tpm: 30000
       parameters:
         temperature: 0.7
       pricing: # USD per 1,000 tokens

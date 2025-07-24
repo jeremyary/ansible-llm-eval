@@ -6,8 +6,39 @@ from typing import Any, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
+from langsmith import Client
 
 from config_manager import load_config
+
+
+def submit_langsmith_feedback_async(run_id: str, feedback_value: bool) -> None:
+    """Submits feedback to LangSmith for the given run_id."""
+    if not run_id or not os.getenv("LANGSMITH_API_KEY"):
+        return
+    
+    try:
+        import threading
+        
+        def send_feedback():
+            try:
+                client = Client()
+                client.create_feedback(
+                    run_id=run_id,
+                    key="user_rating",
+                    score=1.0 if feedback_value else 0.0,
+                    value="positive" if feedback_value else "negative"
+                )
+            except Exception as e:
+                # Log error but don't show in UI since this is async
+                print(f"Failed to submit LangSmith feedback: {str(e)}")
+        
+        # Send feedback in background thread to avoid blocking UI
+        thread = threading.Thread(target=send_feedback)
+        thread.daemon = True
+        thread.start()
+        
+    except Exception as e:
+        print(f"Failed to start feedback thread: {str(e)}")
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -43,6 +74,125 @@ def load_data(conn: sqlite3.Connection) -> Tuple[pd.DataFrame, pd.DataFrame]:
     results_df = pd.read_sql_query(query, conn)
     errors_df = pd.read_sql_query("SELECT * FROM errors", conn)
     return results_df, errors_df
+
+
+def should_collapse_chunk(results_df: pd.DataFrame, sample_id: str) -> bool:
+    """Determines if a chunk should be collapsed based on all providers reporting no errors."""
+    model_responses = results_df[
+        (results_df['sample_id'] == sample_id) &
+        (pd.notna(results_df['model'])) &
+        (results_df['success'] == True)
+    ]
+    
+    if model_responses.empty:
+        return False
+    
+    # Get the three expected providers
+    providers = set()
+    summaries = {}
+    for _, response_row in model_responses.iterrows():
+        provider, _ = response_row['model'].split(":", 1)
+        providers.add(provider)
+        summaries[provider] = response_row['summary'].strip() if response_row['summary'] else ""
+    
+    # Check if we have all three providers
+    expected_providers = {"openai", "anthropic", "gemini"}
+    if not expected_providers.issubset(providers):
+        return False
+    
+    # Check if all providers reported "No errors found."
+    for provider in expected_providers:
+        if summaries.get(provider, "") != "No errors found.":
+            return False
+    
+    return True
+
+
+def render_chunk_content(chunk_row, model_responses):
+    """Renders the content and model responses for a chunk."""
+    st.text_area(
+        "original log content",
+        chunk_row["original_content"],
+        height=400,
+        key=f"content_{chunk_row['sample_id']}",
+        label_visibility="collapsed"
+    )    
+
+    if not model_responses.empty:
+        for _, response_row in model_responses.iterrows():
+            provider, _ = response_row['model'].split(":", 1)
+            run_id = response_row.get('run_id')
+
+            # Create columns for provider name, toggle, and stats
+            col1, col2, col3 = st.columns([0.075, 0.075, 0.85])
+            
+            with col1:
+                if provider == "openai":
+                    provider_html = f'<span class="openai-provider-name">{provider.upper()}</span>'
+                elif provider == "anthropic":
+                    provider_html = f'<span class="anthropic-provider-name">{provider.upper()}</span>'
+                elif provider == "gemini":
+                    provider_html = f'<span class="google-provider-name">{provider.upper()}</span>'
+                else:
+                    provider_html = f'<span class="provider-name">{provider.upper()}</span>'
+                st.markdown(provider_html, unsafe_allow_html=True)
+            
+            with col2:
+                # LangSmith feedback toggle (defaults to False/off)
+                if run_id and os.getenv("LANGSMITH_API_KEY"):
+                    feedback_key = f"feedback_{chunk_row['sample_id']}_{provider}"
+                    previous_key = f"{feedback_key}_previous"
+                    
+                    feedback_value = st.toggle(
+                        "Accurate?", 
+                        value=False, 
+                        key=feedback_key
+                    )
+                    
+                    # Only submit feedback when toggle actually changes (not on initial render)
+                    if previous_key in st.session_state and st.session_state[previous_key] != feedback_value:
+                        submit_langsmith_feedback_async(run_id, feedback_value)
+                    
+                    # Store current value for next comparison
+                    st.session_state[previous_key] = feedback_value
+                else:
+                    st.write("")  # Empty space when LangSmith not available
+            
+            with col3:
+                if response_row['success']:
+                    stats = (
+                        f"latency: {response_row['latency_ms']:.0f}ms &nbsp;|&nbsp; "
+                        f"tokens: {response_row['input_tokens']}/{response_row['output_tokens']} &nbsp;|&nbsp; "
+                        f"retries: {response_row['retry_attempts']}"
+                    )
+                    stats_html = f'<span class="stats-text">[ {stats} ]</span>'
+                    st.markdown(stats_html, unsafe_allow_html=True)
+                else:
+                    st.write("")  # Empty space for failed responses
+
+            summary_text = f"{response_row['summary']}" or "No summary generated."
+            suggestion_marker = "[SUGGESTION]"
+
+            if suggestion_marker in summary_text:
+                parts = summary_text.split(suggestion_marker, 1)
+                main_summary = parts[0].strip()
+                suggestion = parts[1].strip()
+                summary_html = f"""
+                <div class="summary-text">
+                    {main_summary}</br>
+                    <div class="suggestion-text">{suggestion}</div>
+                </div>
+                """
+            else:
+                summary_html = f"""
+                <div class="summary-text">
+                    <p>{summary_text}</p>
+                </div>
+                """
+            st.markdown(summary_html, unsafe_allow_html=True)
+
+            if not response_row['success']:
+                st.error(f"**Error:** {response_row['error_message']}")
 
 
 def calculate_statistics(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
@@ -94,7 +244,7 @@ def run_app() -> None:
             border: 1px solid #444;
             border-radius: 7px;
             padding: 10px 10px 1px 10px;
-            margin-top:0;
+            margin-top:100px;
             margin-bottom: 7px;
         }
         .summary-box p {
@@ -147,9 +297,47 @@ def run_app() -> None:
             margin-left: 1em;
             margin-right: 1em;
             margin-bottom: 1em;
+            margin-top: 0;
             border-radius: 10px;
             border: 2px solid #333;
             padding: 20px;
+        }
+        .collapsed-summary {
+            font-size: 0.9em;
+            color: #888;
+            margin-left: 1em;
+            font-style: italic;
+        }
+        .stExpander {
+            border: 1px solid #444;
+            border-radius: 5px;
+            background-color: #1a1c24;
+        }
+        .stExpander > div > div > div > div {
+            background-color: #1a1c24;
+        }
+        .stCheckbox {
+            margin-top: 0 !important;
+        }
+        .stCheckbox > label:has(input[type="checkbox"]:not(:checked)) > div:first-child {
+            background-color: #dc3545 !important; /* Red when OFF */
+        }
+        .stCheckbox > label:has(input[type="checkbox"]:checked) > div:first-child {
+            background-color: #28a745 !important; /* Green when ON */
+        }
+        .stColumn {
+            padding: 0 0 0 0;
+        }
+        .stVerticalBlock {
+            padding-right: 0;
+            padding-left: 0;
+        }
+        .stMarkdown > div > p {
+            margin-bottom: 0;
+        }
+        .stHorizontalBlock {
+            padding-bottom: 0;
+            margin-bottom: 0;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -195,126 +383,40 @@ def run_app() -> None:
         by=["filename", "chunk_index"]
     ).drop_duplicates(subset=['sample_id'])
 
+    # Count collapsed vs expanded chunks
+    collapsed_count = 0
+    total_count = len(all_chunks)
+
     for _, chunk_row in all_chunks.iterrows():
+        sample_id = chunk_row['sample_id']
+        should_collapse = should_collapse_chunk(results_df, sample_id)
+        
+        if should_collapse:
+            collapsed_count += 1
 
         st.markdown(f"</br></br>", unsafe_allow_html=True)
         stats = f"chunk {chunk_row['chunk_index'] + 1}"
-        st.markdown(f"### {os.path.basename(chunk_row['filename'])} &nbsp; ({stats})", unsafe_allow_html=True)
-
-        st.text_area(
-            "original log content",
-            chunk_row["original_content"],
-            height=400,
-            key=f"content_{chunk_row['sample_id']}",
-            label_visibility="collapsed"
-        )    
-
+        
         model_responses = results_df[
-            (results_df['sample_id'] == chunk_row['sample_id']) &
+            (results_df['sample_id'] == sample_id) &
             (pd.notna(results_df['model']))
         ].sort_values(by="model")
 
-        if not model_responses.empty:
-            for _, response_row in model_responses.iterrows():
-                provider, _ = response_row['model'].split(":", 1)
+        if should_collapse:
+            # Collapsed view - use expander
+            header = f"✅ {os.path.basename(chunk_row['filename'])} ({stats}) - No errors found"
+            with st.expander(header, expanded=False):
+                st.markdown('<div class="collapsed-summary">All providers reported no errors in this chunk. Expand to view details.</div>', unsafe_allow_html=True)
+                render_chunk_content(chunk_row, model_responses)
+        else:
+            # Normal expanded view
+            st.markdown(f"### {os.path.basename(chunk_row['filename'])} &nbsp; ({stats})", unsafe_allow_html=True)
+            render_chunk_content(chunk_row, model_responses)
 
-                # stats_html = ""
-                if response_row['success']:
-                    stats = (
-                        f"latency: {response_row['latency_ms']:.0f}ms &nbsp;|&nbsp; "
-                        f"tokens: {response_row['input_tokens']}/{response_row['output_tokens']} &nbsp;|&nbsp; "
-                        f"retries: {response_row['retry_attempts']}"
-                    )
-                    stats_html = f'&nbsp; <span class="stats-text">[ {stats} ]</span>'
-
-                if provider == "openai":
-                    provider_html = f'<span class="openai-provider-name">{provider.upper()}</span>'
-                elif provider == "anthropic":
-                    provider_html = f'<span class="anthropic-provider-name">{provider.upper()}</span>'
-                elif provider == "google":
-                    provider_html = f'<span class="google-provider-name">{provider.upper()}</span>'
-                else:
-                    provider_html = f'<span class="provider-name">{provider.upper()}</span>'
-                
-                line_html = f"<span class='provider-title-row'>{provider_html} {stats_html}</span>"
-                st.markdown(line_html, unsafe_allow_html=True)
-
-                summary_text = f"{response_row['summary']}" or "No summary generated."
-                suggestion_marker = "[SUGGESTION]"
-
-                if suggestion_marker in summary_text:
-                    parts = summary_text.split(suggestion_marker, 1)
-                    main_summary = parts[0].strip()
-                    suggestion = parts[1].strip()
-                    summary_html = f"""
-                    <div class="summary-text">
-                        {main_summary}</br>
-                        <div class="suggestion-text">{suggestion}</div>
-                    </div>
-                    """
-                else:
-                    summary_html = f"""
-                    <div class="summary-text">
-                        <p>{summary_text}</p>
-                    </div>
-                    """
-                st.markdown(summary_html, unsafe_allow_html=True)
-
-                if not response_row['success']:
-                    st.error(f"**Error:** {response_row['error_message']}")
-        
-    js_script = """
-    <script>
-        function styleAllSliders() {
-            const sliders = document.querySelectorAll('.stSlider');
-
-            sliders.forEach(slider => {
-                const thumb = slider.querySelector('[role="slider"]');
-                if (!thumb) return;
-
-                const min = parseInt(thumb.getAttribute('aria-valuemin'), 10);
-                const max = parseInt(thumb.getAttribute('aria-valuemax'), 10);
-                const value = parseInt(thumb.getAttribute('aria-valuemax'), 10);
-
-                const percentage = ((value - min) / (max - min));
-
-                let r, g, b;
-                if (percentage < 0.5) {
-                    r = 255;
-                    g = Math.round(510 * percentage);
-                } else {
-                    r = Math.round(510 - 510 * percentage);
-                    g = 255;
-                }
-                b = 0;
-                const color = `rgb(${r}, ${g}, ${b})`;
-
-                const trackFill = slider.querySelector('div[data-baseweb="slider"] > div:nth-child(2)');
-                const thumbElement = slider.querySelector('div[data-baseweb="slider"] > div:nth-child(3)');
-
-                if (trackFill) {
-                    trackFill.style.background = color;
-                }
-                if (thumbElement) {
-                    thumbElement.style.backgroundColor = color;
-                }
-            });
-        }
-
-        const observer = new MutationObserver((mutations) => {
-            styleAllSliders();
-        });
-
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
-
-        // Initial run
-        styleAllSliders();
-    </script>
-    """
-    st.markdown(js_script, unsafe_allow_html=True)
-
+    # Show summary of collapsed chunks
+    if collapsed_count > 0:
+        st.markdown("</br>", unsafe_allow_html=True)
+        st.info(f"📋 **Summary**: {collapsed_count} out of {total_count} chunks had no errors reported by all providers and are shown collapsed. Click to expand any collapsed entry to view details.")
+          
 if __name__ == "__main__":
     run_app()
